@@ -196,3 +196,71 @@
 
 - 新增 7 项回归测试（质检规则误伤/真伤、R4、00_task.json 终态、跨任务污染、兜底失败路径、礼貌客户端重试/耗尽）。
 - pytest 终验：`23 passed`。
+
+---
+
+## Session 6 — 2026-09-05/06｜三轮外部评审查证 → P0 交付门禁落地
+
+**起因**：引入外部只读评审作为对抗性输入，要求逐条验证而非照单接受。前一阶段约束为"不修改，只回应"；验证完成、缺陷定性清楚后才授权修改。分支：`fix/p0-delivery-gate`。
+
+### 查证方法
+
+三个只读诊断脚本（项目真实组件 + 单点 Agent 桩 + 临时目录/临时 SQLite，不写仓库），加一次对仓库自带 `data/tasks.db` 的只读盘点。原则：不接受"读代码觉得"，只接受运行时证据；并把"合成实验证明可达"与"历史数据已真实发生"严格分开标注。
+
+### 查证结论
+
+**推翻 4 处机制性误判**：
+
+1. "返工像自动抽奖" → 实为**确定性空转**：`prompt` 步骤执行 1 次而 `generation`/`review` 各 3 次，三轮裁决签名 `unique=1`。返工没有改变 Review 的任何输入。
+2. 评审虚构的返工实现 → 实际是把结构化的逐镜逐条原因注入 tool-calling 任务单；该机制对 R3 有效，对提示词级规则无效（图生工具的 prompt 被代码确定性覆盖，Review 只读 `prompts` 产物）。
+3. "1 个 commit 无法证明系统逐步演化" → 本文件即演化证据（逐 session 的事故→修复→证据链）；评审未读 `docs/`，其批评的 Redis/规则质检/Mock 三件事在架构文档 D1/D4/D3+D7 已有取舍说明。
+4. "README 最容易让人误解" → 测试档对照表与已知限制已明确披露 mock 不按提示词生成、生产级真动需接图生视频模型；问题是披露位置排在标题之后，不是隐瞒。
+
+**确认成立**：过度 Agent 化（ReviewAgent / ComposeAgent 全程零 LLM 调用）、无评估体系、Candidate Ranking 优于 retry-until-good、生产级成熟度低。
+
+### 定位到的 P0 缺陷：Verdict 与 Delivery Eligibility 脱钩
+
+实测链路：R6 命中旁白 → 三轮返工裁决逐字相同 → `ACCEPTED_FALLBACK` → ComposeAgent 只读 `storyboard`、不读 `scene_states` → 违规旁白烧成字幕进入 `final.mp4`（**用同一句违规旁白重渲染的帧与流水线产出的帧逐字节相同**）→ 任务对外报 `SUCCEEDED`。
+
+仓库历史数据中，同一空转模式**已真实发生两次**：`98d7181120d0`（保温杯）与 `d9d57bb5f0ff`（运动水壶），均为 R6、均 `retried steps: generation [1,2,3]`、均降级采用 + 任务 SUCCEEDED。（这两次命中的是 `video_prompt`，违规词进入生成提示词但未直接上画面；"烧进成片"走的是 `narration` 路径，属合成实验证明的可达路径。两者暴露面不同，不可混为一谈。）
+
+同时定位到 4 个配套缺口：`export_task_bundle` 只在 SUCCEEDED 路径调用（FAILED 任务无任何磁盘产物）；`scene_states` 从未写入交付包；`_clamp_durations` 已实现"确定性修复优先"却只覆盖 R4；两条合成分支产出不同交付物（mock 档烧字幕、真实图档不烧）。
+
+### 做了什么（Plan A，全程 TDD：先红后绿）
+
+1. **A1 审计包不分成败**：抽出 `WorkflowEngine._export_bundle`，成功与失败双路径都导出；`00_task.json` 增加 `scene_states`。
+2. **A2 诊断固化为回归测试**：新建 `tests/test_p0_defects.py`，以 `xfail(strict=True)` 记录两个缺陷；`tests/conftest.py` 抽出共享 `build_engine` / `create_task`，`test_workflow.py` 改为委托（消除重复装配）。
+3. **A3 结构化裁决**：`models.Finding(rule_id, field, message, owner, severity)`；`review_agent` 增加 `_RULE_META` 归属表与 `make_finding()`，`_execute` 改为一次命中同时产出人读 `reasons` 与机器读 `findings`（同源同序同数量，message 逐字未变以保住既有断言）。
+4. **A4 交付门禁**：新建 `app/core/repair_policy.py`（`REPAIR_ACTIONS` + `has_repair`，返工路由的唯一真相来源）；`SceneStatus.BLOCKED` 终态（仅可由 REJECTED 进入）；`_review_retry_loop` 头部插入门禁——BLOCKER 且无修复通道则置 BLOCKED、不返工、抛 `StepFailure`，随后仍导出审计包。
+5. **A5 文档同批**：PRD（FR-4 改写、AC 新增第 5 条并顺延、"git 提交历史清晰"改为如实描述）、架构文档（状态图加 BLOCKED、Agent 契约表加 findings、新增 ADR D10~D12、演进路线补 6~9 项）、README（流程图 Review 行、人工经验表、双层状态机与质检返工两条 bullet、已知限制补 3 条）。
+
+### 关键决策
+
+- **owner 与 severity 两轴正交，缺一不可**：只有 owner 则合规文案照样出货，只有 severity 则返工继续空转。
+- **门禁做在 workflow 层，不做在 Compose**：Compose 因此无需理解 severity，改动面更小、职责更干净。
+- **拒绝三项外部建议**（理由写入 D10）：`scope` 第三轴（当前无 task 级规则，且 scope 是 owner 的函数）、`ApprovedSceneManifest` 新 artifact（`scene_states` 已是交付资格载体）、状态四拆（scene 级 FAILED 与 task 级冗余，+1 个 BLOCKED 足够）。
+- **导出时机必须先修**：否则门禁落地后会得到一批"被正确拦截但查无实据"的任务。
+- **发布顺序**：未修复状态的自审描述不单独进公开仓库，与修复同批一次写完（即本条目）。
+
+### 事故与修复（本轮自身，如实记录）
+
+1. conftest 抽 helper 后 `test_scene_state_not_leaked_across_tasks` 报 `NameError`（该测试内联使用了被删掉的 `utc_now` / `TaskRecord`）→ 改用共享 `create_task` helper。计划书风险表已预判此类，处置一致。
+2. 计划书预测 `32 passed`，实际 **33 passed**：算术漏了"xfail 转 passed 也要计入 passed"。已更正计划书。
+3. 诊断脚本首跑失败（桩函数返回 dict，而调用方还要 `.model_dump()`）→ 修正后重跑；失败那次不计入证据。
+4. 自我更正一处口述数字：曾说"6 次注定无效的付费生成"，DB 盘点后为 **4 次无效 generation 重跑**（2 任务 × 2 次返工）；且"付费"仅对真实模式下的 LLM tool-calling 调用成立，素材生成档位未落库故无法归因。
+5. 编辑工具本轮对"含长中文行的替换"持续故障（短补丁可成、长补丁必挂），文档同步改用带断言的精确替换脚本：每处断言"恰好命中一次"，不符即中止不写入；按 bytes 读写保留各文件原有换行风格（README 为 CRLF，docs 为 LF），改动前已备份原文件。
+
+### 证据
+
+- **pytest 逐阶段**：A0 基线 `23 passed` → A1 `25 passed` → A2 `25 passed, 2 xfailed` → A3 `29 passed, 2 xfailed` → A4 **`33 passed, 1 xfailed`**。
+- **门禁单测**（`test_blocker_compliance_failure_blocks_delivery`，由 xfail 转 passed）：`status=FAILED`、`error` 含"合规门禁"、`scene_states["2"]=BLOCKED`、`generation` 只有 `attempt=1`、`06_final/final.mp4` 不存在、`00_task.json` 与 `05_review/review_report.json` 存在。
+- **端到端 HTTP 复验**（MOCK 档，零成本，端口 8011）：任务 `d0a1c7a422af` → `SUCCEEDED`、三镜全 `ACCEPTED`、0 warning、steps 为 script(1)→prompt(1)→generation(1)→review(1)→compose(1)、成片存在 ⇒ **门禁不误伤正常任务**；同一任务的 `00_task.json` 实测已含 `scene_states` 字段。
+- 仍保留的 1 条 xfail：提示词级失败（R2）返工不会重跑 prompt 步骤——由 Plan B 修复后摘除。
+- 三个诊断脚本的原始 stdout 与 DB 盘点结果保存在项目外归档，不进仓库。
+
+### 下一步
+
+- [ ] **Plan B**：owner routing（按 `Finding.owner` 重跑对应步骤）+ `_sanitize_narration`（与 `_clamp_durations` 对称，须留痕原文/改后/触发规则）+ `PromptAgent`/`ScriptAgent` 局部返工 → 摘掉最后 1 条 xfail。
+- [ ] **Plan C**：`GET /api/v1/metrics`（成功率/返工/降级率/拦截率/P50-P95/规则分布/路由分布）+ usage instrumentation（`chat()` 当前丢弃 `usage`）+ `gen_provider`/`mock_llm` 落库 + 移除 `_move_scenes` 吞异常 + `_scene_machines` 移入 per-task 上下文 + stale RUNNING 恢复。
+- [ ] **Plan D**：Provider 无关后处理（Provider 不再借用 `render_scene_video`）+ 新增 ffmpeg 视频字幕能力（前置缺口：`overlay_subtitle` 只支持静图）+ R2/R6 规则校准。
+- [ ] commit 与 push 由用户执行。

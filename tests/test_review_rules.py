@@ -57,3 +57,44 @@ def test_r4_duration_out_of_spec(tmp_path):
     """场景时长已被 ScriptAgent 钳制到 [2,15]；R4 守的是 Provider 返回的异常时长。"""
     v = _verdict(tmp_path, duration=5.0, clip_duration=20.0)
     assert any(r.startswith("R4") for r in v["reasons"])
+
+
+# ---------------- Finding 结构化事实（owner + severity 双轴） ----------------
+
+def test_r6_narration_finding_is_blocker_owned_by_script(tmp_path):
+    """R6 命中旁白：owner=script（旁白是编剧产物）、severity=BLOCKER（合规不得降级交付）。"""
+    v = _verdict(tmp_path, narration="全网首发的透气科技")
+    r6 = [f for f in v["findings"] if f["rule_id"] == "R6"]
+    assert len(r6) == 1
+    assert r6[0]["field"] == "narration"
+    assert r6[0]["owner"] == "script"
+    assert r6[0]["severity"] == "BLOCKER"
+
+
+def test_r6_prompt_finding_is_blocker_owned_by_prompt(tmp_path):
+    """R6 命中提示词：同样 BLOCKER，但 owner 是 prompt 而不是 script——两轴正交。"""
+    v = _verdict(tmp_path, image_prompt="全网首发质感的保温杯特写画面")
+    r6 = [f for f in v["findings"] if f["rule_id"] == "R6"]
+    assert r6 and all(f["severity"] == "BLOCKER" for f in r6)
+    assert any(f["owner"] == "prompt" for f in r6)
+
+
+def test_r2_finding_is_major_owned_by_prompt(tmp_path):
+    """R2 未覆盖商品关键词：MAJOR（必须返工，耗尽可降级），owner=prompt。"""
+    v = _verdict(tmp_path,
+                 image_prompt="一段与商品完全无关的风景描述画面",
+                 video_prompt="镜头缓慢移动，画面稳定")
+    r2 = [f for f in v["findings"] if f["rule_id"] == "R2"]
+    assert len(r2) == 1
+    assert r2[0]["owner"] == "prompt"
+    assert r2[0]["severity"] == "MAJOR"
+
+
+def test_findings_and_reasons_stay_in_sync(tmp_path):
+    """人读 reasons 与机器读 findings 必须同源同序同数量，避免两处漂移。"""
+    v = _verdict(tmp_path, narration="全网首发的透气科技",
+                 image_prompt="一段与商品完全无关的风景描述画面",
+                 video_prompt="镜头缓慢移动，画面稳定")
+    assert not v["passed"]
+    assert len(v["findings"]) == len(v["reasons"])
+    assert all(f["message"] == r for f, r in zip(v["findings"], v["reasons"]))

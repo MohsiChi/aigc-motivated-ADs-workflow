@@ -65,3 +65,33 @@ def test_scene_cannot_skip_review():
     sm.transition(SceneStatus.GENERATING)
     with pytest.raises(IllegalTransitionError):
         sm.transition(SceneStatus.ACCEPTED)
+
+
+def test_scene_blocked_is_terminal():
+    """BLOCKED 是终态：进得去，出不来。"""
+    sm = StateMachine(SCENE_TRANSITIONS, SceneStatus.PENDING)
+    sm.transition(SceneStatus.GENERATING)
+    sm.transition(SceneStatus.IN_REVIEW)
+    sm.transition(SceneStatus.REJECTED)
+    sm.transition(SceneStatus.BLOCKED)
+    assert sm.state is SceneStatus.BLOCKED
+    assert not sm.can_transition(SceneStatus.GENERATING)
+    with pytest.raises(IllegalTransitionError):
+        sm.transition(SceneStatus.ACCEPTED)
+
+
+def test_accepted_scene_cannot_be_blocked():
+    """已验收的镜头不得被事后拦截（ACCEPTED 是终态）。"""
+    sm = StateMachine(SCENE_TRANSITIONS, SceneStatus.PENDING)
+    sm.transition(SceneStatus.GENERATING)
+    sm.transition(SceneStatus.IN_REVIEW)
+    sm.transition(SceneStatus.ACCEPTED)
+    assert not sm.can_transition(SceneStatus.BLOCKED)
+
+
+def test_blocked_only_reachable_from_rejected():
+    """只有经质检判定不通过，才允许进入 BLOCKED——不许绕过质检直接拦。"""
+    assert SceneStatus.BLOCKED not in SCENE_TRANSITIONS[SceneStatus.PENDING]
+    assert SceneStatus.BLOCKED not in SCENE_TRANSITIONS[SceneStatus.GENERATING]
+    assert SceneStatus.BLOCKED not in SCENE_TRANSITIONS[SceneStatus.IN_REVIEW]
+    assert SceneStatus.BLOCKED in SCENE_TRANSITIONS[SceneStatus.REJECTED]

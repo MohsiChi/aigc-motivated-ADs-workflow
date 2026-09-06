@@ -5,6 +5,8 @@ Artifact 驱动架构：每个 Agent 只接收/产出结构化产物（而不是
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field
 
 
@@ -62,12 +64,33 @@ class Clip(BaseModel):
 
 # ---------------- Review Agent 产物 ----------------
 
+class Finding(BaseModel):
+    """单条质检发现：把"哪条规则、哪个字段、谁负责修、多严重"变成结构化事实。
+
+    两个轴严格正交：
+    - owner    回答"谁修"              -> 决定返工路由（重跑哪个步骤）
+    - severity 回答"修不好还能不能交付" -> 决定交付策略（返工 / 降级 / 拦截）
+
+    只加 owner 不加 severity，修完路由之后合规文案照样会进成片；
+    只加 severity 不加 owner，返工依然会确定性空转。两者缺一不可。
+    """
+
+    rule_id: str = Field(..., description="规则编号，如 R1~R6")
+    field: str = Field(..., description="出问题的字段，如 narration / image_prompt / clip_path")
+    message: str = Field(..., description="人读描述，与 SceneVerdict.reasons 中对应项逐字相同")
+    owner: Literal["script", "prompt", "generation"] = Field(
+        ..., description="缺陷归属的步骤：谁产出这个字段，谁负责修")
+    severity: Literal["BLOCKER", "MAJOR", "MINOR"] = Field(
+        ..., description="BLOCKER=合规/安全，不得降级交付；MAJOR=相关性/契约，必须返工；MINOR=规格/美学，可降级")
+
+
 class SceneVerdict(BaseModel):
     """单个镜头的质检裁决。"""
 
     scene_id: int
     passed: bool
-    reasons: list[str] = Field(default_factory=list)
+    reasons: list[str] = Field(default_factory=list)       # 人读（保留：向后兼容 + 报告可读性）
+    findings: list[Finding] = Field(default_factory=list)  # 机器读（返工路由与交付门禁的依据）
 
 
 class ReviewReport(BaseModel):

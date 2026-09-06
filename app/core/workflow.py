@@ -17,6 +17,7 @@ from app.agents.base import AgentContext, BaseAgent
 from app.config import Settings
 from app.core.exporter import export_task_bundle
 from app.core.models import ReviewReport, Storyboard, TaskRecord
+from app.core.repair_policy import has_repair
 from app.core.state_machine import (
     SCENE_TRANSITIONS,
     TASK_TRANSITIONS,
@@ -96,6 +97,24 @@ class WorkflowEngine:
             self._store.update_task(task_id, status="FAILED", error=error)
         self._store.fail_running_steps(task_id, "worker 异常中断")
 
+    def _export_bundle(self, ctx: AgentContext, task_id: str, note: str) -> None:
+        """导出规范化产物目录。成功与失败路径都必须调用。
+
+        失败任务同样需要审计留痕——尤其合规门禁拦截的场景，
+        00_task.json 与 05_review/review_report.json 正是事后追责要看的东西。
+
+        前置条件：任务状态已落终态、scene_states 已写入 artifacts，
+        这样 00_task.json 里的 status / scene_states 一定是终态快照
+        （延续 Session 1 定下的"状态最后写"对外可见性契约）。
+        """
+        rec = self._store.get_task(task_id)
+        if rec is None:
+            return
+        bundle = export_task_bundle(rec, self._settings.output_dir / task_id)
+        self._store.merge_artifact(task_id, "export_dir", str(bundle))
+        ctx.artifacts["export_dir"] = str(bundle)
+        self._store.append_event(task_id, f"规范化产物已导出: {bundle}（{note}）")
+
     # ---------------- 核心：跑一个任务 ----------------
 
     def run_task(self, task_id: str) -> None:
@@ -139,18 +158,15 @@ class WorkflowEngine:
             self._persist_scene_states(ctx)
             self._store.update_task(task_id, status="FAILED", error=str(e))
             self._store.append_event(task_id, f"任务失败: {e}")
+            self._export_bundle(ctx, task_id, "失败审计包")
             return
 
         sm.transition(TaskStatus.SUCCEEDED)
         self._persist_scene_states(ctx)
         # 状态最后写：读到 SUCCEEDED 的调用方，产物一定已经齐了（对外可见性契约）
         self._store.update_task(task_id, status="SUCCEEDED")
-        # 状态落定之后再导出产物目录：00_task.json 里的 status 必须是终态
-        rec_done = self._store.get_task(task_id)
-        bundle = export_task_bundle(rec_done, self._settings.output_dir / task_id)
-        self._store.merge_artifact(task_id, "export_dir", str(bundle))
-        ctx.artifacts["export_dir"] = str(bundle)
-        self._store.append_event(task_id, f"规范化产物已导出: {bundle}")
+        # 状态落定之后再导出：00_task.json 里的 status / scene_states 必须是终态
+        self._export_bundle(ctx, task_id, "交付包")
         self._store.append_event(task_id, "任务完成")
         log.info("[%s] SUCCEEDED", task_id)
 
@@ -206,10 +222,57 @@ class WorkflowEngine:
         ctx.artifacts["scene_states"] = states
         self._store.merge_artifact(ctx.task_id, "scene_states", states)
 
+    # ---------------- 交付门禁（Verdict -> Delivery Gate） ----------------
+
+    @staticmethod
+    def _collect_blocked(report: ReviewReport) -> dict[int, list[str]]:
+        """挑出"含 BLOCKER 级发现且当前无修复通道"的镜头 -> {scene_id: [rule_id, ...]}"""
+        blocked: dict[int, list[str]] = {}
+        for v in report.verdicts:
+            if v.passed:
+                continue
+            rules = sorted({
+                f.rule_id for f in v.findings
+                if f.severity == "BLOCKER" and not has_repair(f.rule_id, f.field)
+            })
+            if rules:
+                blocked[v.scene_id] = rules
+        return blocked
+
+    def _apply_blocked(self, ctx: AgentContext, blocked: dict[int, list[str]]) -> None:
+        """置 BLOCKED 终态并留痕。
+
+        必须先落状态、再让上层抛 StepFailure——这样 _persist_scene_states 与失败审计包
+        （00_task.json / 05_review/review_report.json）里都能看到"哪个镜头被拦、因为哪条规则"。
+        合规拦截恰恰是最需要留痕的场景，不能只留一条 DB 事件。
+        """
+        for sid, rules in blocked.items():
+            machine = self._scene_machines.get(sid)
+            if machine is not None and machine.can_transition(SceneStatus.BLOCKED):
+                machine.transition(SceneStatus.BLOCKED)
+            msg = f"镜头 {sid} 触发 BLOCKER 级门禁 {rules}，当前无修复通道，不予交付"
+            self._store.add_warning(ctx.task_id, msg)
+            self._store.append_event(ctx.task_id, msg, step="review")
+            log.warning("[%s] %s", ctx.task_id, msg)
+        self._persist_scene_states(ctx)
+
     # ---------------- 质检返工循环 ----------------
 
     def _review_retry_loop(self, ctx: AgentContext, sm_task: StateMachine) -> None:
         report = ReviewReport.model_validate(ctx.artifacts["review_report"])
+
+        # 交付门禁：BLOCKER 级发现且当前无修复通道时，
+        # ① 不进入返工循环——重跑注定得到逐字相同的裁决，白烧重试额度与生成成本；
+        # ② 不允许降级采用——"降级"对美学失败是合理策略，对合规失败是错误策略。
+        # 语义：Verdict 必须成为 Delivery Gate，而不是只产生一条意见。
+        blocked = self._collect_blocked(report)
+        if blocked:
+            self._apply_blocked(ctx, blocked)
+            detail = "；".join(
+                f"镜头 {sid} 触发 {rules}" for sid, rules in sorted(blocked.items())
+            )
+            raise StepFailure(f"合规门禁未通过，任务不予交付 —— {detail}")
+
         rejected = [v.scene_id for v in report.verdicts if not v.passed]
         attempt = 1
         while rejected and attempt <= self._settings.max_scene_retries:

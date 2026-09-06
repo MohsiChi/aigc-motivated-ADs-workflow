@@ -5,40 +5,17 @@ import pathlib
 import pytest
 
 from app.agents.base import AgentContext, AgentError
-from app.agents.compose_agent import ComposeAgent
-from app.agents.generation_agent import GenerationAgent
 from app.agents.prompt_agent import PromptAgent
-from app.agents.review_agent import ReviewAgent
 from app.agents.script_agent import ScriptAgent
-from app.core.models import TaskRecord
-from app.core.task_store import TaskStore, utc_now
-from app.core.workflow import WorkflowEngine
-from app.tools.providers.mock_provider import MockProvider
+from tests.conftest import build_engine, create_task
 
 
 def _build(tmp_settings):
-    store = TaskStore(tmp_settings.db_path)
-    provider = MockProvider(tmp_settings.output_dir)
-    agents = {
-        "script": ScriptAgent(llm=None),
-        "prompt": PromptAgent(llm=None),
-        "generation": GenerationAgent(provider, llm=None),
-        "review": ReviewAgent(),
-        "compose": ComposeAgent(),
-    }
-    engine = WorkflowEngine(store, tmp_settings, agents)
-    return store, engine
+    return build_engine(tmp_settings)
 
 
 def _create_task(store, topic="给这双鞋子做个广告", scene_count=3) -> str:
-    task_id = "testtask0001"
-    now = utc_now()
-    store.create_task(TaskRecord(
-        id=task_id, topic=topic, product_info="轻便跑鞋，透气网面",
-        scene_count=scene_count, status="PENDING",
-        created_at=now, updated_at=now,
-    ))
-    return task_id
+    return create_task(store, topic=topic, scene_count=scene_count)
 
 
 def test_full_pipeline_happy_path(tmp_settings):
@@ -160,12 +137,7 @@ def test_scene_state_not_leaked_across_tasks(tmp_settings, monkeypatch):
         raise AgentError("模拟编剧失败")
 
     monkeypatch.setattr(ScriptAgent, "_execute", boom)
-    second = "testtask0002"
-    now = utc_now()
-    store.create_task(TaskRecord(
-        id=second, topic="另一个主题测试", scene_count=3, status="PENDING",
-        created_at=now, updated_at=now,
-    ))
+    second = create_task(store, task_id="testtask0002", topic="另一个主题测试")
     engine.run_task(second)
     rec = store.get_task(second)
     assert rec.status == "FAILED"
@@ -186,3 +158,35 @@ def test_fail_task_safe_closes_running_steps(tmp_settings):
     assert "模拟 worker 异常" in (rec.error or "")
     steps = store.list_steps(task_id)
     assert steps[0]["status"] == "FAILED"
+
+
+def test_failed_task_exports_audit_bundle(tmp_settings, monkeypatch):
+    """P0-A1：失败任务也必须落盘审计包——合规/致命失败最需要留痕。"""
+    store, engine = _build(tmp_settings)
+    task_id = _create_task(store)
+
+    def boom(self, ctx):
+        raise AgentError("模拟编剧爆炸")
+
+    monkeypatch.setattr(ScriptAgent, "_execute", boom)
+    engine.run_task(task_id)
+
+    rec = store.get_task(task_id)
+    assert rec.status == "FAILED"
+    assert "export_dir" in rec.artifacts, "失败路径没有导出产物目录"
+    meta_path = pathlib.Path(rec.artifacts["export_dir"]) / "00_task.json"
+    assert meta_path.exists()
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["status"] == "FAILED", "00_task.json 必须是终态快照"
+
+
+def test_bundle_meta_contains_scene_states(tmp_settings):
+    """P0-A1：00_task.json 必须带镜头级状态——双层状态机要在交付物里可见。"""
+    store, engine = _build(tmp_settings)
+    task_id = _create_task(store)
+    engine.run_task(task_id)
+
+    rec = store.get_task(task_id)
+    meta_path = pathlib.Path(rec.artifacts["export_dir"]) / "00_task.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    assert meta["scene_states"] == {"1": "ACCEPTED", "2": "ACCEPTED", "3": "ACCEPTED"}

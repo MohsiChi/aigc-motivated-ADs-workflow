@@ -46,7 +46,7 @@
 | Workflow 引擎 | 进程内队列 + Worker，顺序编排四步流水线 | 任务调度、Workflow 编排 |
 | 5 个 Sub-Agent | script / prompt / generation / review / compose，统一接口、可插拔 | Multi-Agent、组件化 |
 | Tool Calling | 生成类工具以 JSON Schema 注册，LLM 决策 + 程序执行 | Tool Calling |
-| 质检与重试 | 规则化质量门禁 + 有限次返工 | 质量门禁、重试逻辑 |
+| 质检与重试 | 规则化质量门禁 + 结构化裁决（owner/severity 双轴）+ 有限次返工 + BLOCKER 级交付门禁 | 质量门禁、重试逻辑、失败处理 |
 | 剪辑合成 | Compose Agent：关键帧 + 字幕 + 运镜 -> 真实可播放 MP4（ffmpeg，零成本） | 视频业务链路落地 |
 | 持久化 | SQLite（stdlib）：任务/步骤/事件三表留痕 | 可观测、审计 |
 | 测试 | pytest 覆盖状态机、流水线、API | 工程质量 |
@@ -64,7 +64,7 @@
 - **FR-1 任务提交**：`POST /api/v1/tasks`，入参 `{topic, product_info?, scene_count?}`；校验后落库（PENDING），入队，返回 `task_id`。
 - **FR-2 任务查询**：`GET /api/v1/tasks/{task_id}` 返回状态、当前步骤、错误、告警、全部 artifacts、步骤历史、镜头级状态；不存在返回 404。
 - **FR-3 流水线**：script → prompt → generation → review 顺序执行；任一步失败则任务 FAILED 并记录错误；步骤级输入输出全部落库。
-- **FR-4 质检重试**：质检不通过的镜头自动返工（最多 `MAX_SCENE_RETRIES` 次，默认 2）；返工携带质检原因；重试耗尽后镜头标记 `ACCEPTED_FALLBACK`（降级采用）并产生告警，任务仍可完成。
+- **FR-4 质检重试与交付门禁**：质检不通过的镜头自动返工（最多 `MAX_SCENE_RETRIES` 次，默认 2），返工携带质检原因；裁决按 severity 分级——BLOCKER（合规）在无修复通道时置 `BLOCKED` 终态、不返工、不降级、任务 FAILED 并导出审计包；MAJOR/MINOR 重试耗尽后 `ACCEPTED_FALLBACK` 降级采用并告警，任务仍可完成。每条命中同时产出人读描述与机器读事实 `Finding(rule_id, field, owner, severity)`，两者同源同序同数量（见架构文档 D10）。
 - **FR-5 留痕**：任务生命周期事件（创建/开始/重试/完成/失败）写入 `task_events` 表；运行日志写文件。
 - **FR-6 Mock 模式**：`MOCK_LLM=1`（默认）时全流程零外部调用、输出确定可复现；`MOCK_LLM=0` 走真实 DeepSeek。
 - **FR-7 成片输出**：无论何种 Provider，任务完成后必须产出真实可播放的 `final.mp4`（字幕 + 运镜 + 拼接）；Provider 已产出真实镜头 MP4 时，剪辑自动切换为纯拼接模式。
@@ -82,10 +82,11 @@
 1. `POST /api/v1/tasks` 返回 202 + `task_id`；随后 `GET` 可查到任务。
 2. 状态机只允许合法流转，非法流转抛出 `IllegalTransitionError`（有测试证明）。
 3. Mock 模式下全流程跑完：任务 SUCCEEDED，artifacts 含 `storyboard / prompts / generation / review_report / scene_states` 五件套，素材文件真实落盘。
-4. 构造"质检不通过"场景：能观察到重试记录（步骤 attempt>1、事件表留痕），重试耗尽后出现 `ACCEPTED_FALLBACK` 与告警，任务仍 SUCCEEDED。
-5. `pytest` 全绿。
-6. git 提交历史清晰；`docs/` 下 PRD/架构/调研/开发日志齐备。
-7. 全真实模式（真实 LLM + 免费真实图片源）端到端产出可播放成片（已验证：任务 `283e1b1bf1fd`）。
+4. 构造"质检不通过"场景（MAJOR/MINOR 级）：能观察到重试记录（步骤 attempt>1、事件表留痕），重试耗尽后出现 `ACCEPTED_FALLBACK` 与告警，任务仍 SUCCEEDED。
+5. 构造"BLOCKER 级合规不通过"场景：镜头置 `BLOCKED`、不产生返工步骤（`generation` 只有 attempt=1）、不产出 `06_final/final.mp4`、任务 FAILED，但仍导出含 `00_task.json`（终态 status + `scene_states`）与 `05_review/review_report.json` 的审计包（有测试证明）。
+6. `pytest` 全绿；已知但尚未修复的缺陷以 `xfail(strict=True)` 显式标注，修复后必须摘标记，不允许静默通过。
+7. 开发过程可追溯：`docs/dev-log.md` 逐 session 记录"做了什么 / 为什么 / 证据 / 下一步"。仓库 git 历史因清理私人上下文已压缩为单次提交，过程证据以 dev-log 为准。
+8. 全真实模式（真实 LLM + 免费真实图片源）端到端产出可播放成片（已验证：任务 `283e1b1bf1fd`）。
 
 ## 7. 风险与对策
 

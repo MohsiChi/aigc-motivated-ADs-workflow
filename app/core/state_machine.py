@@ -33,6 +33,7 @@ class SceneStatus(str, Enum):
     ACCEPTED = "ACCEPTED"                    # 质检通过
     REJECTED = "REJECTED"                    # 质检不通过（可返工）
     ACCEPTED_FALLBACK = "ACCEPTED_FALLBACK"  # 重试耗尽后降级采用（v1 策略：不阻塞整片，只告警）
+    BLOCKED = "BLOCKED"                      # 合规/安全门禁未通过且无修复通道：不可交付（终态）
 
 
 TASK_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
@@ -46,9 +47,11 @@ SCENE_TRANSITIONS: dict[SceneStatus, set[SceneStatus]] = {
     SceneStatus.PENDING: {SceneStatus.GENERATING},
     SceneStatus.GENERATING: {SceneStatus.IN_REVIEW},
     SceneStatus.IN_REVIEW: {SceneStatus.ACCEPTED, SceneStatus.REJECTED},
-    SceneStatus.REJECTED: {SceneStatus.GENERATING, SceneStatus.ACCEPTED_FALLBACK},
+    SceneStatus.REJECTED: {SceneStatus.GENERATING, SceneStatus.ACCEPTED_FALLBACK,
+                           SceneStatus.BLOCKED},
     SceneStatus.ACCEPTED: set(),
     SceneStatus.ACCEPTED_FALLBACK: set(),
+    SceneStatus.BLOCKED: set(),
 }
 
 

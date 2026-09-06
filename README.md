@@ -19,7 +19,7 @@ POST /api/v1/tasks {"topic": "给这双鞋子做个广告"}
         ↓
 [Generation Agent]  生成：Tool Calling 驱动，先关键帧后图生视频
         ↓
-[Review Agent]  质检：6 条规则门禁（含广告法极限词），不过自动返工
+[Review Agent]  质检：6 条规则门禁（含广告法极限词）+ 分级裁决：MAJOR 返工 / BLOCKER 拦截不予交付
         ↓
 [Compose Agent]  剪辑：字幕叠加 + 推近运镜 + 淡入淡出转场 → final.mp4
 ```
@@ -28,8 +28,8 @@ POST /api/v1/tasks {"topic": "给这双鞋子做个广告"}
 | 《蛋壳黑陶》人工做法 | 沉淀为本项目里的设计 |
 |---|---|
 | 即梦"首尾帧"模式串联镜头转场，保证镜头衔接不跳变 | Tool Calling 契约：先出关键帧、图生视频工具必须接收上一镜关键帧路径（先关键帧后成片） |
-| "生成 → 验收 → 返工"逐镜质量门禁，废弃素材全程留痕可追溯 | 镜头级状态机 + Review Agent 规则质检返工闭环；steps/events 三表全程留痕 |
-| 旁白成文后按字数/语速逐段对轨，保证声画同步 | 分镜契约内嵌 narration 旁白与 duration_s 秒级规格；旁白以字幕呈现由 Compose 自动叠加 |
+| "生成 → 验收 → 返工"逐镜质量门禁，废弃素材全程留痕可追溯 | 镜头级状态机 + Review Agent 规则质检返工闭环（BLOCKER 级合规失败不予交付）；steps/events 三表全程留痕 |
+| 旁白成文后按字数/语速逐段对轨，保证声画同步 | 分镜契约内嵌 narration 旁白与 duration_s 秒级规格；旁白由 Compose 自动叠加为字幕（**仅测试档**，见"已知限制"） |
 | 剪映人工剪辑（节奏/转场/混音）| Compose Agent 自动化合成 + 规范化产物目录（00~06，JSON/MD 双形态，Exporter 统一落盘） |
 
 ## 测试档说明
@@ -39,7 +39,7 @@ POST /api/v1/tasks {"topic": "给这双鞋子做个广告"}
 | 编剧 / 提示词（LLM） | （如DeepSeek，可换任意 OpenAI 兼容模型） | `MOCK_LLM=0` 时真实调用；`=1` 时用确定性假数据（测试用） |
 | 关键帧图片 | 三档可选（见下） | 测试档=占位图；免费档=测试文生图；生产档=预留位置 |
 | 视频片段 | 免费/测试档 = 本地 ffmpeg 合成（画面是"动的运镜"，内容不产生新动作）；**生产级"真动"需接图生视频模型** | `tools/providers/jimeng_provider.py` 是预留插座 |
-| 剪辑合成 | （ffmpeg：字幕 + 运镜 + 转场） | 基础版：无 BGM、无真人配音（旁白以字幕呈现）、无节奏变化 |
+| 剪辑合成 | （ffmpeg：字幕 + 运镜 + 转场） | 基础版：无 BGM、无真人配音、无节奏变化；字幕仅在测试档合成路径生效（见"已知限制"） |
 | 状态机 / 调度 / 重试 / 持久化 / 留痕 |  | 双层状态机、SQLite 三表、质检返工循环 |
 
 三档素材生成（环境变量 `GEN_PROVIDER`）：
@@ -111,9 +111,9 @@ Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/v1/tasks/<task_id>" | ConvertT
 
 - **提交即返回**：`POST /tasks` 落库（PENDING）入队后立即返回 `task_id`，HTTP 请求不阻塞——长耗时生成任务的标准做法。
 - **后台调度**：Worker 线程从队列取任务，按流水线顺序执行（v1 进程内队列；队列是注入的边界，v2 可换 Redis 而不动引擎）。
-- **双层状态机**：任务级 `PENDING→RUNNING→SUCCEEDED/FAILED`；镜头级 `PENDING→GENERATING→IN_REVIEW→ACCEPTED/REJECTED→(返工)`。非法流转直接抛异常。
+- **双层状态机**：任务级 `PENDING→RUNNING→SUCCEEDED/FAILED`；镜头级 `PENDING→GENERATING→IN_REVIEW→ACCEPTED/REJECTED→(返工)`，另有 `BLOCKED` 终态承载"合规门禁未通过、不予交付"。非法流转直接抛异常。
 - **Artifact 驱动**：Agent 之间不互相"聊天"，只传递上一步的结构化产物——不背全量对话历史，上下文不膨胀。
-- **质检返工闭环**：规则不通过 → 携原因返工（最多 `MAX_SCENE_RETRIES` 次）→ 耗尽则降级采用并告警，不阻塞整片。
+- **质检返工闭环（分级）**：裁决带 owner / severity 双轴。MAJOR/MINOR 不通过 → 携原因返工（最多 `MAX_SCENE_RETRIES` 次）→ 耗尽则降级采用并告警，不阻塞整片；**BLOCKER（合规）不通过且无修复通道 → 镜头置 `BLOCKED`、不返工（重跑注定得到逐字相同的裁决）、不出成片、任务 FAILED 并导出审计包**。
 - **对 LLM 输出的工程兜底**：LLM 输出是不可靠依赖——JSON 契约兜底修复、返工原因喂回、漏镜自动补做，都是真实事故换来的防线。
 - **双轨留痕**：SQLite 存任务/步骤/事件（API 可查、可审计）；磁盘存规范化产物目录（人可读、可交付）。
 
@@ -152,6 +152,9 @@ scripts/               # run.ps1 / test.ps1 / smoke_real_llm.py / recompose_show
 
 ## 已知限制（v2 路线，详见架构文档）
 
-- 剪辑为基础版：**无 BGM、无真人配音（旁白仅字幕）、无节奏变化**；转场仅淡入淡出。
+- 剪辑为基础版：**无 BGM、无真人配音、无节奏变化**；转场仅淡入淡出；旁白以字幕呈现，且**字幕只在测试档生效**（见下条）。
 - 免费档图片质量依赖英文提示词（中文提示词对 Flux 系模型不敏感，本项目已自动切换英文版）。
 - 中途被杀的任务停留在 RUNNING，缺 stale-task 恢复；并发/队列/成本计量均为 v2 议题。
+- **旁白字幕只在测试档生效**：真实图档的 Provider 直接返回镜头 MP4，Compose 走"直接拼接"分支，旁白不会烧成字幕；补齐需要新增 ffmpeg 视频字幕（drawtext）能力，属 v2。
+- **MAJOR 级返工尚未按 owner 路由**：提示词级规则（R1/R2/R5/R6-提示词）失败时仍重跑 generation，裁决不会改变。该缺陷已用 `xfail(strict=True)` 测试显式标注，修复见架构文档演进路线第 6 项。
+- **无指标端点与成本计量**：成功率/返工/延迟的原料已在 steps 表但未聚合暴露；LLM token usage 未落库，因此当前无法给出真实单条成本（不做估算伪装）。

@@ -27,6 +27,8 @@ def export_task_bundle(task: TaskRecord, task_dir: Path) -> Path:
         "created_at": task.created_at,
         "updated_at": task.updated_at,
         "artifacts_index": sorted(art.keys()),
+        # 双层状态机的镜头级那一层必须在交付物里可见（治理的前提是可审计）
+        "scene_states": art.get("scene_states", {}),
     }
     _write_json(dirs["root"] / "00_task.json", meta)
 
