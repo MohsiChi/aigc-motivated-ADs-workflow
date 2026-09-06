@@ -264,3 +264,50 @@
 - [ ] **Plan C**：`GET /api/v1/metrics`（成功率/返工/降级率/拦截率/P50-P95/规则分布/路由分布）+ usage instrumentation（`chat()` 当前丢弃 `usage`）+ `gen_provider`/`mock_llm` 落库 + 移除 `_move_scenes` 吞异常 + `_scene_machines` 移入 per-task 上下文 + stale RUNNING 恢复。
 - [ ] **Plan D**：Provider 无关后处理（Provider 不再借用 `render_scene_video`）+ 新增 ffmpeg 视频字幕能力（前置缺口：`overlay_subtitle` 只支持静图）+ R2/R6 规则校准。
 - [ ] commit 与 push 由用户执行。
+
+---
+
+## Session 7 — 2026-09-06｜F15 修复：消除状态机与质检报告的静默不一致
+
+**起因**：Session 6 收尾时把 `_move_scenes` 吞 `IllegalTransitionError`（F12）列为待修项。用户要求"先确认再万无一失地修改"，确认过程中发现 F12 只是表象，底下藏着一条更深的路径（编号 F15）。
+
+### 确认过程（为什么不能直接改）
+
+F12 的原计划是"把 warning 换成 raise"。逐行核对后发现这样做会把一个本可完成的任务变成崩溃，因为**非法流转当前是可达的**：
+
+1. `rejected` 原先由**质检报告**推导（`[v.scene_id for v in report.verdicts if not v.passed]`），不是由状态机推导。
+2. `_apply_verdicts` 遇到「已 ACCEPTED 但本轮报告判不通过」时，因 ACCEPTED 是终态、`can_transition(REJECTED)` 为 False 而**静默 continue**，状态保持 ACCEPTED。
+3. 但该镜头仍在 `rejected` 里 → `_move_scenes(rejected, GENERATING)` 触发 `ACCEPTED→GENERATING` 非法流转 → 被吞成 warning → 循环继续 → **该镜头被无谓重新生成一遍**。
+4. 收尾再触发一次非法流转再被吞一次。终局：状态机说 ACCEPTED、报告说 failed、行为是重生成过，三者矛盾，对外只有 SUCCEEDED + 两条 warning。
+
+**可达性分析**：R1/R2/R5/R6 的输入（`prompts` / `storyboard`）在返工轮之间不变，不会翻转；R4 只对返工镜头生效而那些本就是 REJECTED；**唯一可达路径是 R3**——它检查磁盘文件是否存在，已 ACCEPTED 镜头的关键帧/片段在两轮之间消失即翻转。概率低但非零且无防护。
+
+### 做了什么（三步，顺序不可颠倒）
+
+1. `_apply_verdicts`：区分「真幂等」（`state == target`，保持静默 continue）与「终态 vs 新裁决矛盾」（记 warning + `append_event` 留痕，状态不回退）。
+2. 新增 `_rejected_scenes()`：`rejected` 改由状态机推导（只取 `state is REJECTED`），`reasons` 仍从报告取但按 `rejected` 过滤。这样四个 `_move_scenes` 调用点**按构造合法**。
+3. `_move_scenes`：去掉 try/except，非法流转先 `log.error` 再抛 `IllegalTransitionError`。
+
+**顺序理由**：合法性必须先成为结构性保证（第 2 步），守卫才能真正生效（第 3 步）。颠倒顺序等于把静默错乱换成崩溃。
+
+**语义决策**：矛盾时取「记警告并继续」而非「判任务 FAILED」——终态是设计意图，镜头内容未变、首轮 ACCEPTED 判断依然有效，因外部删文件就整单失败对调用方过脆。记为 ADR D13。
+
+### 证据
+
+- **红灯验证（关键）**：把修复前的 `workflow.py` 换回后运行新测试，测试确实失败（`AssertionError: ['镜头 2 重试 2 次后仍未通过质检，降级采用']`——没有不一致留痕），且 `logs/app.log` 记录了 **2 次被吞的非法流转**：`ACCEPTED -> GENERATING`、`ACCEPTED -> IN_REVIEW`。这是 F15 可达性的运行时实证，不是推演。
+- **绿灯验证**：换回修复版后新测试通过。
+- **全量**：`pytest` 由 `33 passed, 1 xfailed` → **`34 passed, 1 xfailed`**。
+- **不误伤**：真实 HTTP 端到端复验（MOCK 档、零成本、端口 8012），任务 `2cfb26963c50` → SUCCEEDED、三镜全 ACCEPTED、0 warning、无返工、成片存在、`00_task.json` 终态与 `scene_states` 正确。
+- 修复后的代码在绿灯轮与全量套件中**零新增**非法流转命中。
+
+### 顺手修的
+
+- `.gitignore` 补 `.idea/`：用户以 IDE 打开项目后出现未跟踪的 `.idea/`，而 `git add -A` 会把它提交进公开仓库。
+
+### 下一步
+
+- [ ] 仍保留的 1 条 xfail：MAJOR 级返工未按 owner 路由（提示词级失败仍确定性空转）——后续计划的第一项。
+- [ ] `_scene_machines` 移入 per-task 执行上下文（多 Worker 前置）。
+- [ ] stale RUNNING 任务恢复。
+- [ ] commit 与 push 由用户执行。
+

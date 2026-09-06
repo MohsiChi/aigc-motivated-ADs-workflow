@@ -200,10 +200,13 @@ class WorkflowEngine:
             machine = self._scene_machines.get(sid)
             if machine is None:
                 continue
-            try:
-                machine.transition(target)
-            except IllegalTransitionError as e:
-                log.warning("镜头状态流转异常（已忽略继续）: %s", e)
+            if not machine.can_transition(target):
+                # 不再静默吞掉非法流转：调用点已保证按构造合法（见 _rejected_scenes），
+                # 走到这里说明编排逻辑本身有 bug，必须在第一现场暴露（对齐架构文档 §2）。
+                log.error("镜头 %s 非法流转 %s -> %s（编排逻辑 bug）",
+                          sid, machine.state.value, target.value)
+                raise IllegalTransitionError(machine.state, target)
+            machine.transition(target)
 
     def _apply_verdicts(self, ctx: AgentContext) -> None:
         report = ReviewReport.model_validate(ctx.artifacts["review_report"])
@@ -212,10 +215,30 @@ class WorkflowEngine:
             if machine is None:
                 continue
             target = SceneStatus.ACCEPTED if verdict.passed else SceneStatus.REJECTED
-            # 幂等：返工轮里已 ACCEPTED 的镜头会被复检报告再次覆盖，状态保持即可
-            if machine.state == target or not machine.can_transition(target):
+            if machine.state == target:
+                continue  # 真幂等：返工轮里已定态的镜头被复检报告再次覆盖
+            if not machine.can_transition(target):
+                # 终态与本轮裁决矛盾。唯一可达路径是 R3：它检查磁盘文件是否存在，
+                # 已 ACCEPTED 镜头的关键帧/片段在两轮之间消失即会翻转。
+                # 终态是设计意图，不回退；但矛盾必须留痕，不能静默吞掉（F15）。
+                msg = (f"镜头 {verdict.scene_id} 已处于终态 {machine.state.value}，"
+                       f"但本轮质检判为{'通过' if verdict.passed else '不通过'}"
+                       f"（{verdict.reasons}）；状态保持不变，记为不一致")
+                self._store.add_warning(ctx.task_id, msg)
+                self._store.append_event(ctx.task_id, msg, step="review")
+                log.warning("[%s] %s", ctx.task_id, msg)
                 continue
             machine.transition(target)
+
+    def _rejected_scenes(self) -> list[int]:
+        """从状态机推导待返工镜头，而不是从质检报告推导。
+
+        这是让 _move_scenes 每个调用点"按构造合法"的关键：只有 REJECTED 会进入返工，
+        已 ACCEPTED / ACCEPTED_FALLBACK / BLOCKED 的终态镜头不会被再次流转，
+        也不会被无谓地重新生成一遍（F15：报告与状态机不一致时的静默错乱）。
+        """
+        return sorted(sid for sid, m in self._scene_machines.items()
+                      if m.state is SceneStatus.REJECTED)
 
     def _persist_scene_states(self, ctx: AgentContext) -> None:
         states = {str(sid): m.state.value for sid, m in sorted(self._scene_machines.items())}
@@ -273,12 +296,14 @@ class WorkflowEngine:
             )
             raise StepFailure(f"合规门禁未通过，任务不予交付 —— {detail}")
 
-        rejected = [v.scene_id for v in report.verdicts if not v.passed]
+        rejected = self._rejected_scenes()
         attempt = 1
         while rejected and attempt <= self._settings.max_scene_retries:
             attempt += 1
             reasons = {
-                str(v.scene_id): v.reasons for v in report.verdicts if not v.passed
+                str(v.scene_id): v.reasons
+                for v in report.verdicts
+                if not v.passed and v.scene_id in rejected
             }
             self._store.append_event(
                 ctx.task_id,
@@ -292,7 +317,7 @@ class WorkflowEngine:
             self._run_step(ctx, "review", attempt=attempt)
             self._apply_verdicts(ctx)
             report = ReviewReport.model_validate(ctx.artifacts["review_report"])
-            rejected = [v.scene_id for v in report.verdicts if not v.passed]
+            rejected = self._rejected_scenes()
 
         if rejected:
             # 重试耗尽：降级采用 + 告警（v1 策略：不阻塞整片；生产中可改人工复核）
