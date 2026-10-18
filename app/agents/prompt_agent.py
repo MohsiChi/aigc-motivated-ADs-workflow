@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import json
+
 from app.agents.base import AgentContext, AgentError, BaseAgent
 from app.core.models import PromptPack, ScenePrompt, Storyboard
 from app.llm.client import DeepSeekClient
@@ -30,24 +32,46 @@ class PromptAgent(BaseAgent):
 
     def _execute(self, ctx: AgentContext) -> dict:
         storyboard = Storyboard.model_validate(ctx.artifacts["storyboard"])
+        only = ctx.extra.get("scene_ids")
+        scenes = [s for s in storyboard.scenes if only is None or s.scene_id in only]
+        if not scenes:
+            raise AgentError("没有可生成提示词的镜头")
+        selected = Storyboard(topic=storyboard.topic, scenes=scenes)
         if ctx.settings.mock_llm or self._llm is None:
-            pack = self._mock_prompts(ctx, storyboard)
-            return pack.model_dump()
-        user_prompt = (
-            f"主题：{ctx.topic}\n分镜脚本：{storyboard.model_dump_json()}\n"
-            f"请为全部 {len(storyboard.scenes)} 个镜头输出提示词三件套。只输出 JSON。"
-        )
-        data = self._llm.chat_json_robust(system=SYSTEM_PROMPT, user=user_prompt)
-        self._repair_in_place(data)
-        try:
-            pack = PromptPack.model_validate(data)
-        except Exception as e:
-            raise AgentError(f"提示词 JSON 校验失败: {e}") from e
-        expected = {s.scene_id for s in storyboard.scenes}
-        got = {p.scene_id for p in pack.prompts}
-        if expected != got:
+            pack = self._mock_prompts(ctx, selected)
+        else:
+            user_prompt = (
+                f"主题：{ctx.topic}\n商品信息：{ctx.product_info}\n"
+                f"分镜脚本：{selected.model_dump_json()}\n"
+                f"只为镜头 {[s.scene_id for s in scenes]} 输出提示词三件套。只输出 JSON。"
+            )
+            feedback = ctx.extra.get("review_feedback") or {}
+            if feedback:
+                previous = [p for p in ctx.artifacts.get("prompts", {}).get("prompts", [])
+                            if p["scene_id"] in {s.scene_id for s in scenes}]
+                user_prompt += (
+                    f"\n这是第 {int(ctx.extra.get('attempt', 2)) - 1} 次返工。"
+                    "请逐条修复质检问题，保留商品信息并重新编写提示词。"
+                    f"\n上轮提示词：{json.dumps(previous, ensure_ascii=False)}"
+                    f"\n质检反馈：{json.dumps(feedback, ensure_ascii=False)}"
+                )
+            data = self._llm.chat_json_robust(system=SYSTEM_PROMPT, user=user_prompt)
+            self._repair_in_place(data)
+            try:
+                pack = PromptPack.model_validate(data)
+            except Exception as e:
+                raise AgentError(f"提示词 JSON 校验失败: {e}") from e
+        expected = {s.scene_id for s in scenes}
+        # 返工响应可能仍包含全片；只采纳本轮指定镜头，保护已通过的提示词。
+        generated = [p for p in pack.prompts if only is None or p.scene_id in expected]
+        got = {p.scene_id for p in generated}
+        if expected != got or len(generated) != len(expected):
             raise AgentError(f"提示词镜头覆盖不完整: 期望 {sorted(expected)}, 实际 {sorted(got)}")
-        return pack.model_dump()
+        previous = ctx.artifacts.get("prompts", {}).get("prompts", []) if only is not None else []
+        merged = [ScenePrompt.model_validate(p) for p in previous if p["scene_id"] not in expected]
+        merged.extend(generated)
+        merged.sort(key=lambda p: p.scene_id)
+        return PromptPack(topic=storyboard.topic, prompts=merged).model_dump()
 
     @staticmethod
     def _repair_in_place(data: dict) -> None:

@@ -1,9 +1,7 @@
 """P0 缺陷的回归测试。
 
 来源：2026-09-05 三个只读诊断脚本的实测结论。
-手法：以 xfail(strict=True) 固化"当前是坏的"这一事实。修复落地后测试会 XPASS，
-strict 会让 pytest 失败，强制在同一次提交里摘掉标记——缺陷不会被悄悄遗忘，
-测试也不会"悄悄变绿没人注意"。
+两个已修复缺陷均作为常规回归测试运行；提示词路由原有的 strict xfail 已移除。
 
 两个缺陷的性质区别（很重要，别混）：
 - BLOCKER 级合规失败进入交付物：已由逐字节帧比对实证（违规旁白确实烧进了成片帧）。
@@ -12,8 +10,7 @@ strict 会让 pytest 失败，强制在同一次提交里摘掉标记——缺�
 """
 import pathlib
 
-import pytest
-
+from app.agents.compose_agent import ComposeAgent
 from app.agents.prompt_agent import PromptAgent
 from app.agents.script_agent import ScriptAgent
 from app.core.models import Scene, Storyboard
@@ -63,10 +60,6 @@ def test_blocker_compliance_failure_blocks_delivery(tmp_settings, monkeypatch):
     assert not (bundle / "06_final" / "final.mp4").exists(), "违规旁白不得进入成片"
 
 
-@pytest.mark.xfail(
-    reason="后续计划未实现：R2 归属 prompt，但返工只重跑 generation，裁决确定性空转",
-    strict=True,
-)
 def test_prompt_owned_failure_reruns_prompt_step(tmp_settings, monkeypatch):
     """提示词级失败（R2）必须重跑 prompt 步骤，否则返工无法改变 Review 的输入。"""
     store, engine = build_engine(tmp_settings)
@@ -84,6 +77,7 @@ def test_prompt_owned_failure_reruns_prompt_step(tmp_settings, monkeypatch):
             for i in range(1, ctx.scene_count + 1)]}
 
     monkeypatch.setattr(PromptAgent, "_execute", broken_prompts)
+    monkeypatch.setattr(ComposeAgent, "_execute", lambda self, ctx: {"composed": True})
     engine.run_task(task_id)
 
     assert calls["n"] > 1, "R2 归属 prompt，返工必须重跑 prompt 步骤"

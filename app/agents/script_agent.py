@@ -36,6 +36,15 @@ class ScriptAgent(BaseAgent):
             f"请写 {ctx.scene_count} 个镜头。只输出 JSON。"
         )
         data = self._llm.chat_json_robust(system=SYSTEM_PROMPT, user=user_prompt)
+        # 在 Pydantic 的宽松类型转换前校验 ID，避免 bool/字符串/小数被转成整数。
+        raw_scenes = data.get("scenes") if isinstance(data, dict) else None
+        if not isinstance(raw_scenes, list) or len(raw_scenes) != ctx.scene_count:
+            raise AgentError(f"脚本镜头数必须为 {ctx.scene_count}")
+        scene_ids = [s.get("scene_id") if isinstance(s, dict) else None for s in raw_scenes]
+        if any(type(sid) is not int or sid <= 0 for sid in scene_ids):
+            raise AgentError("脚本 scene_id 必须是正整数")
+        if len(set(scene_ids)) != len(scene_ids):
+            raise AgentError("脚本 scene_id 不得重复")
         self._clamp_durations(data)
         try:
             storyboard = Storyboard.model_validate(data)
@@ -75,5 +84,17 @@ class ScriptAgent(BaseAgent):
                 visual="产品全景 + 价格标签 + 购买引导按钮，氛围明亮温暖",
                 duration_s=4,
             ),
-        ][: ctx.scene_count]
+        ]
+        if ctx.scene_count > 3:
+            # 扩展中段演示镜头，保留默认三镜头的原有文案与时长。
+            ending = scenes.pop()
+            for sid in range(3, ctx.scene_count):
+                scenes.append(Scene(
+                    scene_id=sid, title=f"细节演示 {sid - 1}",
+                    narration=f"再看看{topic}的使用细节，感受它在日常场景中的表现。",
+                    visual=f"{topic} 使用细节与不同角度特写，清晰展示产品特点",
+                    duration_s=5,
+                ))
+            scenes.append(ending.model_copy(update={"scene_id": ctx.scene_count}))
+        scenes = scenes[:ctx.scene_count]
         return Storyboard(topic=topic, scenes=scenes)

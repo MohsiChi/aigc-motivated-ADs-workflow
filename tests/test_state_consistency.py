@@ -2,15 +2,17 @@
 
 构造方式：让镜头 2 的提示词必然触发 R2（MAJOR，可返工）以产生返工轮；
 在第 2 轮生成开始前删掉镜头 1 的关键帧文件，使镜头 1 在复检时 R3 失败。
-这是唯一可达的翻转路径（R1/R2/R5/R6 的输入在返工轮之间不变，只有 R3 查磁盘）。
+提示词局部修复后仍必须保护其他镜头，R3 还会发现轮次之间消失的素材。
 
 修复前（F15）的行为：镜头 1 留在 rejected 里 -> ACCEPTED->GENERATING 非法流转被吞成
 warning -> 镜头 1 被无谓重新生成 -> 收尾再非法一次 -> 状态机/报告/行为三者矛盾且无留痕。
-修复后的行为：终态不动、留下不一致告警、镜头 1 不被重生成、全程无非法流转。
+交付契约：终态不动、留下不一致告警、镜头 1 不被重生成、全程无非法流转；
+最新报告否定已接受素材时任务必须失败，不能带着缺失素材继续合成。
 """
 import pathlib
 
 from app.agents.generation_agent import GenerationAgent
+from app.agents.compose_agent import ComposeAgent
 from app.agents.prompt_agent import PromptAgent
 from tests.conftest import build_engine, create_task
 
@@ -51,6 +53,7 @@ def test_accepted_scene_late_r3_failure_is_recorded_not_regenerated(tmp_settings
         return real_gen(self, ctx)
 
     monkeypatch.setattr(GenerationAgent, "_execute", gen_wrapper)
+    monkeypatch.setattr(ComposeAgent, "_execute", lambda self, ctx: {"composed": True})
 
     engine.run_task(task_id)
     rec = store.get_task(task_id)
@@ -66,10 +69,12 @@ def test_accepted_scene_late_r3_failure_is_recorded_not_regenerated(tmp_settings
     assert retry_rounds, "应当至少发生一轮返工（镜头 2 的 R2 失败）"
     assert all(1 not in s for s in retry_rounds), f"镜头 1 被无谓重生成: {retry_rounds}"
 
-    # ④ 全程不因非法流转而崩（选项 A：记警告并继续，任务仍可完成）
+    # ④ 任务级拒绝交付，不需要回退镜头终态或制造非法流转。
     assert "非法状态流转" not in (rec.error or ""), rec.error
-    assert rec.status == "SUCCEEDED", (rec.status, rec.error)
+    assert rec.status == "FAILED", (rec.status, rec.error)
+    assert "不一致" in rec.error
+    assert "compose" not in rec.artifacts
 
-    # ⑤ 镜头 2 走的是正常返工->降级路径（证明修复没有削弱原有行为）
-    assert rec.artifacts["scene_states"]["2"] == "ACCEPTED_FALLBACK"
-    assert any("降级采用" in w for w in rec.warnings), rec.warnings
+    # ⑤ 已知交付不完整后不再消耗重试预算或降级。
+    assert len(retry_rounds) == 1
+    assert not any("降级采用" in w for w in rec.warnings), rec.warnings

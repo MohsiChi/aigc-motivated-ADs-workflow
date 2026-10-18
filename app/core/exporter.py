@@ -22,6 +22,7 @@ def export_task_bundle(task: TaskRecord, task_dir: Path) -> Path:
         "topic": task.topic,
         "product_info": task.product_info,
         "status": task.status,
+        "error": task.error,
         "current_step": task.current_step,
         "warnings": task.warnings,
         "created_at": task.created_at,
@@ -30,7 +31,6 @@ def export_task_bundle(task: TaskRecord, task_dir: Path) -> Path:
         # 双层状态机的镜头级那一层必须在交付物里可见（治理的前提是可审计）
         "scene_states": art.get("scene_states", {}),
     }
-    _write_json(dirs["root"] / "00_task.json", meta)
 
     # 01 分镜脚本
     storyboard = art.get("storyboard")
@@ -53,6 +53,8 @@ def export_task_bundle(task: TaskRecord, task_dir: Path) -> Path:
     if review:
         _write_json(dirs["review"] / "review_report.json", review)
 
+    # 元信息最后写，避免正文导出失败时留下看似完整的成功快照。
+    _write_json(dirs["root"] / "00_task.json", meta)
     return dirs["root"]
 
 

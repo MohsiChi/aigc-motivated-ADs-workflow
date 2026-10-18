@@ -6,13 +6,15 @@
 因为重跑注定得到逐字相同的裁决（已由运行时实测证明：prompt 步骤只执行 1 次
 而 review 执行 3 次，三轮裁决签名完全一致）。
 
-本阶段只登记已具备真实修复通道的组合；
-后续会补 ("R6","narration") -> sanitize_narration 与 prompt 侧的 regenerate。
+只登记已具备真实修复通道的组合；R6 仍然没有自动文案修复通道。
 """
 from __future__ import annotations
 
 # (rule_id, field) -> 修复动作名。field 为 "*" 表示通配。
 REPAIR_ACTIONS: dict[tuple[str, str], str] = {
+    ("R1", "*"): "regenerate_prompt",
+    ("R2", "*"): "regenerate_prompt",
+    ("R5", "*"): "regenerate_prompt",
     ("R3", "*"): "regenerate_generation",   # 素材缺失/损坏：重跑生成即可
     ("R4", "*"): "regenerate_generation",   # 时长越界：上游已钳制，重跑兜底
 }
@@ -20,4 +22,9 @@ REPAIR_ACTIONS: dict[tuple[str, str], str] = {
 
 def has_repair(rule_id: str, field: str) -> bool:
     """该 (规则, 字段) 组合当前是否有修复通道。"""
-    return (rule_id, field) in REPAIR_ACTIONS or (rule_id, "*") in REPAIR_ACTIONS
+    return repair_action(rule_id, field) is not None
+
+
+def repair_action(rule_id: str, field: str) -> str | None:
+    """查找具体修复动作；未登记意味着不允许自动修复。"""
+    return REPAIR_ACTIONS.get((rule_id, field)) or REPAIR_ACTIONS.get((rule_id, "*"))

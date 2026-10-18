@@ -94,6 +94,15 @@ class TaskStore:
             ).fetchall()
         return [self._to_record(r) for r in rows]
 
+    def list_unfinished_tasks(self) -> list[TaskRecord]:
+        """启动恢复使用完整集合，不能受 API 列表分页上限影响。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM tasks WHERE status IN ('PENDING', 'RUNNING')"
+                " ORDER BY created_at, id"
+            ).fetchall()
+        return [self._to_record(row) for row in rows]
+
     def update_task(
         self,
         task_id: str,

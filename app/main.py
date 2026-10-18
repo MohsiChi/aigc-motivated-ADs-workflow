@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -46,7 +47,8 @@ def build_components(settings: Settings | None = None) -> tuple[Settings, TaskSt
         provider = build_provider(settings)
     except Exception as e:  # noqa: BLE001 例如 jimeng 占位未实现：回退 mock，不让启动崩溃
         log.warning("Provider %s 不可用，回退 mock：%s", settings.gen_provider, e)
-        provider = build_provider(settings.with_overrides(gen_provider="mock"))
+        settings = settings.with_overrides(gen_provider="mock")
+        provider = build_provider(settings)
 
     llm: DeepSeekClient | None = None
     if not settings.mock_llm:
@@ -78,10 +80,12 @@ def build_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        engine.start()
-        yield
-        engine.stop()
-        store.close()
+        try:
+            engine.start()
+            yield
+        finally:
+            await asyncio.to_thread(engine.stop)
+            store.close()
 
     app = FastAPI(
         title="AIGC Multi-Agent 视频生产 Workflow",

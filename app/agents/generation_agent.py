@@ -13,6 +13,7 @@ dispatch 路径——机制不因省钱而改变，这正是 Tool Calling 的要
 from __future__ import annotations
 
 import json
+import math
 
 from app.agents.base import AgentContext, AgentError, BaseAgent
 from app.core.models import Clip, PromptPack, Storyboard
@@ -72,6 +73,7 @@ class GenerationAgent(BaseAgent):
                 redo = [s for s in scenes if s.scene_id in missing]
                 self._llm_tool_loop(
                     ctx, registry, redo, prompt_by_id, tool_results,
+                    en_by_id=en_by_id,
                     extra_note=(
                         f"!! 补做轮：上一轮结束后以下镜头仍未完成，请只补做这些镜头：{missing}。"
                         "每个镜头必须先 generate_keyframe_image 再 generate_video_clip。"
@@ -125,8 +127,11 @@ class GenerationAgent(BaseAgent):
     # ---------------- 真实：LLM 决策的 Tool Calling 循环 ----------------
 
     def _llm_tool_loop(self, ctx, registry, scenes, prompt_by_id, tool_results,
-                       max_rounds: int = 12, extra_note: str = "", en_by_id=None) -> None:
+                       max_rounds: int | None = None, extra_note: str = "", en_by_id=None) -> None:
         en_by_id = en_by_id or {}
+        scene_by_id = {s.scene_id: s for s in scenes}
+        if max_rounds is None:
+            max_rounds = max(12, 2 * len(scenes) + 4)
         task_lines = []
         for s in scenes:
             p = prompt_by_id[s.scene_id]
@@ -156,35 +161,62 @@ class GenerationAgent(BaseAgent):
             messages.append(message)
             for tool_call in message.tool_calls:
                 name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments or "{}")
-                # 确定性切换：图生工具一律用英文提示词（如果 Prompt Agent 产出了）
-                if name == "generate_keyframe_image":
-                    try:
-                        sid = int(args.get("scene_id"))
-                    except (TypeError, ValueError):
-                        sid = None
-                    if sid in en_by_id:
-                        args["prompt"] = en_by_id[sid] + ", commercial advertising photography, high detail"
-                # 兜底：若 LLM 忘了带关键帧路径，帮它补上（工程上叫防御性编程）
-                if name == "generate_video_clip" and not args.get("keyframe_path"):
-                    args["keyframe_path"] = next(
-                        (r["path"] for (n, sid), r in tool_results.items()
-                         if n == "generate_keyframe_image" and sid == args.get("scene_id")),
-                        "",
-                    )
-                raw = registry.dispatch(name, args)
-                parsed = json.loads(raw)
+                parsed = self._execute_tool_call(
+                    registry, name, tool_call.function.arguments, scene_by_id,
+                    tool_results, en_by_id,
+                )
                 if "error" in parsed:
-                    self.log.warning("[%s] 工具执行失败 %s(%s): %s",
-                                     ctx.task_id, name, args.get("scene_id"), parsed["error"])
-                if "error" not in parsed and "scene_id" in args:
-                    tool_results[(name, int(args["scene_id"]))] = parsed
+                    self.log.warning("[%s] 工具执行失败 %s: %s",
+                                     ctx.task_id, name, parsed["error"])
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": raw,
+                    "content": json.dumps(parsed, ensure_ascii=False),
                 })
         raise AgentError(f"Tool Calling 轮数超过 {max_rounds}，可能存在死循环")
+
+    @staticmethod
+    def _execute_tool_call(registry, name, arguments, scene_by_id, tool_results, en_by_id):
+        """只执行当前镜头的有效调用；错误反馈给 LLM，成功产物在本次生成内复用。"""
+        try:
+            if name not in {"generate_keyframe_image", "generate_video_clip"}:
+                raise ValueError(f"未知工具: {name}")
+            args = json.loads(arguments)
+            if not isinstance(args, dict):
+                raise ValueError("工具参数必须是 JSON 对象")
+            sid = args.get("scene_id")
+            if type(sid) is not int or sid not in scene_by_id:
+                raise ValueError("scene_id 必须是本轮任务单中的整数镜头编号")
+            key = (name, sid)
+            if key in tool_results:
+                return tool_results[key]
+            if not isinstance(args.get("prompt"), str) or not args["prompt"].strip():
+                raise ValueError("prompt 必须是非空字符串")
+            if name == "generate_keyframe_image":
+                if sid in en_by_id:
+                    args["prompt"] = en_by_id[sid] + ", commercial advertising photography, high detail"
+            else:
+                duration = args.get("duration_s", scene_by_id[sid].duration_s)
+                if (type(duration) not in (int, float) or not 2 <= duration <= 15
+                        or not math.isfinite(duration)):
+                    raise ValueError("duration_s 必须是 2~15 之间的有限数值")
+                args["duration_s"] = duration
+                image = tool_results.get(("generate_keyframe_image", sid))
+                if image is None:
+                    raise ValueError("必须先成功生成本镜头关键帧")
+                # 无论 LLM 是否提供路径，都绑定本镜头已成功生成的关键帧。
+                args["keyframe_path"] = image["path"]
+            parsed = json.loads(registry.dispatch(name, args))
+            if not isinstance(parsed, dict):
+                raise ValueError("工具结果必须是 JSON 对象")
+            if "error" in parsed:
+                return parsed
+            if not isinstance(parsed.get("path"), str) or not parsed["path"].strip():
+                raise ValueError("工具结果缺少非空 path")
+            tool_results[key] = parsed
+            return parsed
+        except (ValueError, TypeError) as exc:
+            return {"error": str(exc)}
 
     # ---------------- 组装素材清单 ----------------
 

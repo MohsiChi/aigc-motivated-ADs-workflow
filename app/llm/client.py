@@ -18,34 +18,28 @@ class LLMError(RuntimeError):
 def extract_json(text: str) -> dict:
     """从 LLM 输出中提取第一个 JSON 对象。
 
-    容忍 markdown ```json 围栏与前后多余的解释文字；花括号配对扫描，
+    优先解析 markdown ```json 围栏内容，容忍前后多余的解释文字；由 JSON 解码器处理
+    字符串中的括号和转义。首个 JSON 容器必须是对象，不能从数组中捞取对象。
     解析失败抛 LLMError（由上层 Agent 转成步骤失败）。
     """
     if not text:
         raise LLMError("LLM 输出为空")
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
     if fence:
-        candidate = fence.group(1)
+        candidate = fence.group(1).lstrip()
+        offset = 0
     else:
-        start = text.find("{")
-        if start == -1:
+        start = re.search(r"[\[{]", text)
+        if start is None:
             raise LLMError(f"LLM 输出中未找到 JSON: {text[:200]!r}")
-        depth = 0
-        candidate = None
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start : i + 1]
-                    break
-        if candidate is None:
-            raise LLMError("LLM 输出 JSON 花括号不配对")
+        candidate, offset = text, start.start()
     try:
-        return json.loads(candidate)
+        value, _ = json.JSONDecoder().raw_decode(candidate, offset)
     except json.JSONDecodeError as e:
         raise LLMError(f"JSON 解析失败: {e}") from e
+    if not isinstance(value, dict):
+        raise LLMError("LLM 输出 JSON 必须是对象")
+    return value
 
 
 class DeepSeekClient:
